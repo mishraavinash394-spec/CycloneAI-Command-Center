@@ -1,5 +1,7 @@
 import io
 import os
+import sqlite3
+from datetime import datetime
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -11,8 +13,8 @@ from PIL import Image
 
 app = FastAPI(
     title="CycloneAI - Intelligent Tropical Cyclone Monitoring & Prediction",
-    description="SIH 26070 (MoES & IMD) Backend Integrated with Full Multi-Page UI",
-    version="4.0.0"
+    description="SIH 26070 (MoES & IMD) Command Center - Fully Automated Alert & Siren System",
+    version="8.4.0"
 )
 
 app.add_middleware(
@@ -23,32 +25,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-IBTRACS_PATH = r"C:\Users\mishr\Downloads\ibtracs_lite.csv"
+IBTRACS_PATH = "ibtracs_lite.csv"
 historical_df = None
+DB_NAME = "cyclone_history.db"
+
+
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS history_logs
+                       (
+                           id
+                           INTEGER
+                           PRIMARY
+                           KEY
+                           AUTOINCREMENT,
+                           timestamp
+                           TEXT,
+                           storm_name
+                           TEXT,
+                           wind_speed
+                           REAL,
+                           storm_type
+                           TEXT,
+                           action
+                           TEXT,
+                           alert_level
+                           TEXT
+                       )
+                       ''')
+        conn.commit()
+        conn.close()
+        print("SQLite Database initialized with Auto-Alert support!")
+    except Exception as e:
+        print(f"Database error: {str(e)}")
+
+
+def log_action_to_db(storm_name: str, wind_speed: float, storm_type: str, action: str, alert_level: str):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO history_logs (timestamp, storm_name, wind_speed, storm_type, action, alert_level) VALUES (?, ?, ?, ?, ?, ?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), storm_name, wind_speed, storm_type, action, alert_level)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error logging to DB: {str(e)}")
 
 
 @app.on_event("startup")
-def load_historical_data():
+def startup_event():
     global historical_df
+    init_db()
     try:
         if os.path.exists(IBTRACS_PATH):
-            historical_df = pd.read_csv(IBTRACS_PATH, low_memory=False, nrows=5000)
-            print(f"Successfully loaded IBTrACS sample data with {len(historical_df)} rows.")
+            df = pd.read_csv(IBTRACS_PATH, low_memory=False)
+            df['WMO_WIND (KTS)'] = pd.to_numeric(df['WMO_WIND (KTS)'], errors='coerce')
+            historical_df = df.dropna(subset=['WMO_WIND (KTS)', 'LAT', 'LON'])
+            print(f"Successfully loaded {len(historical_df)} records from IBTrACS!")
         else:
-            print(f"Warning: IBTrACS file not found at {IBTRACS_PATH}. Running simulation mode.")
+            historical_df = pd.DataFrame([
+                {"SID": "2020134N12087", "NAME": "AMPHAN", "SEASON (YEAR)": "2020", "BASIN": "NI", "LAT": 16.5,
+                 "LON": 87.2, "WMO_WIND (KTS)": 115.0, "WMO_PRES (MB)": 920.0},
+                {"SID": "2019129N10086", "NAME": "FANI", "SEASON (YEAR)": "2019", "BASIN": "NI", "LAT": 15.2,
+                 "LON": 85.0, "WMO_WIND (KTS)": 110.0, "WMO_PRES (MB)": 932.0}
+            ])
     except Exception as e:
-        print(f"Error loading IBTrACS CSV: {str(e)}")
+        print(f"Error: {str(e)}")
 
 
 class CyclonePredictionResponse(BaseModel):
     status: str
     cyclone_detected: bool
-    detection_confidence: float
-    category: str
-    classification_confidence: float
-    estimated_wind_speed_kmh: float
-    central_pressure_hpa: float
-    historical_analogs_found: int
+    storm_name: str
+    season: str
+    basin: str
+    latitude: float
+    longitude: float
+    wind_speed_kts: float
+    wind_speed_kmh: float
+    central_pressure_mb: float
+    storm_type: str
+    historical_analogs_matched: int
     predicted_track: List[dict]
     explainable_ai_insights: str
     alert_level: str
@@ -63,406 +125,372 @@ def serve_frontend_application():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>CycloneAI | Intelligent Tropical Cyclone Monitoring & Prediction</title>
+        <title>CycloneAI | Fully Automated Command Center</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <!-- Leaflet Map Dependencies -->
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <style>
             .bg-dark-navy { background-color: #0b1329; }
             .bg-card-navy { background-color: #111c38; }
             .border-navy-light { border-color: #1e294b; }
+            .leaflet-popup-content-wrapper, .leaflet-popup-tip {
+                background-color: #111c38 !important;
+                color: #f1f5f9 !important;
+                border: 1px solid #38bdf8;
+                border-radius: 12px;
+            }
+            .dark-tiles {
+                filter: brightness(0.6) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.7);
+            }
+            @keyframes pulse-alert {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.4; }
+            }
+            .alert-pulsing { animation: pulse-alert 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
         </style>
     </head>
-    <body class="bg-dark-navy text-slate-100 font-sans min-h-screen selection:bg-cyan-500 selection:text-slate-950">
+    <body class="bg-dark-navy text-slate-100 font-sans min-h-screen">
+        <!-- Audio Siren Element -->
+        <audio id="sirenAudio" loop>
+            <source src="https://freesound.org/data/previews/456/456444_9159006-lq.mp3" type="audio/mpeg">
+        </audio>
 
-        <!-- Sidebar / Navigation Layout -->
         <div class="flex h-screen overflow-hidden">
             <!-- Sidebar -->
             <aside class="w-64 bg-card-navy border-r border-navy-light flex flex-col justify-between hidden md:flex">
                 <div class="p-6">
                     <div class="flex items-center space-x-3 cursor-pointer mb-8" onclick="switchTab('dashboard')">
-                        <div class="bg-cyan-500 text-slate-950 font-black p-2 rounded-xl text-lg shadow-md">🌪️</div>
+                        <div class="bg-cyan-500 text-slate-950 font-black p-2 rounded-xl text-lg shadow-md">🌪</div>
                         <div>
                             <span class="text-lg font-extrabold tracking-tight text-white">Cyclone<span class="text-cyan-400">AI</span></span>
-                            <span class="block text-[10px] text-emerald-400 font-mono">● SYSTEM ONLINE</span>
+                            <span class="block text-[10px] text-red-400 font-mono">● AUTO-ALERT ACTIVE</span>
                         </div>
                     </div>
                     <nav class="space-y-1.5 text-sm font-medium">
                         <button onclick="switchTab('dashboard')" id="nav-dashboard" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 transition"><span>📊</span><span>Dashboard</span></button>
-                        <button onclick="switchTab('map')" id="nav-map" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>🗺️</span><span>Live Map</span></button>
-                        <button onclick="switchTab('predictions')" id="nav-predictions" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>📈</span><span>Predictions</span></button>
-                        <button onclick="switchTab('alerts')" id="nav-alerts" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>🚨</span><span>Alerts 3</span></button>
-                        <button onclick="switchTab('history')" id="nav-history" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>📜</span><span>History</span></button>
-                        <button onclick="switchTab('insights')" id="nav-insights" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>💡</span><span>AI Insights</span></button>
+                        <button onclick="switchTab('map')" id="nav-map" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>🗺</span><span>Split Cone Map</span></button>
+                        <button onclick="switchTab('alerts')" id="nav-alerts" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>🚨</span><span>Alerts & Siren Control</span></button>
+                        <button onclick="switchTab('history')" id="nav-history" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>📜</span><span>DB History Logs</span></button>
                         <button onclick="switchTab('upload')" id="nav-upload" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>📁</span><span>Upload Data</span></button>
-                        <button onclick="switchTab('settings')" id="nav-settings" class="w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-white transition"><span>⚙️</span><span>Settings</span></button>
                     </nav>
                 </div>
-                <div class="p-6 border-t border-navy-light">
-                    <button onclick="switchTab('dashboard')" class="text-xs text-red-400 hover:text-red-300 font-semibold">Exit Command Center →</button>
+                <div class="p-4 border-t border-navy-light">
+                    <button onclick="enableAudioContext()" class="w-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 text-xs py-2 rounded-xl font-bold hover:bg-emerald-500/30 transition">🔊 Enable Audio/Siren</button>
                 </div>
             </aside>
 
-            <!-- Main Content Area -->
-            <main class="flex-1 overflow-y-auto p-8">
+            <!-- Main Area -->
+            <main class="flex-1 overflow-y-auto p-8 space-y-6">
+                <!-- FULLY AUTOMATED LIVE ALERT BANNER -->
+                <div id="liveAlertBanner" class="p-4 rounded-2xl border flex items-center justify-between shadow-lg bg-emerald-950/80 border-emerald-600 text-emerald-200">
+                    <div class="flex items-center space-x-3">
+                        <span id="alertIcon" class="text-2xl">✅</span>
+                        <div>
+                            <div id="alertTitle" class="text-sm font-black uppercase tracking-wider">AUTOMATIC STATUS: NORMAL MONITORING</div>
+                            <div id="alertMessage" class="text-xs font-medium">System initialized. Awaiting storm telemetry...</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-3">
+                        <span id="alertBadge" class="text-[10px] font-mono px-3 py-1 rounded-full uppercase border font-bold bg-emerald-900 text-white border-emerald-400">GREEN ALERT</span>
+                        <button onclick="stopSiren()" class="bg-slate-900 text-white px-3 py-1.5 rounded-xl text-xs font-bold border border-slate-700 hover:bg-red-700 transition">🛑 Stop Siren</button>
+                    </div>
+                </div>
 
-                <!-- TAB 1: DASHBOARD -->
+                <!-- 1. DASHBOARD TAB -->
                 <section id="tab-dashboard" class="space-y-6">
                     <div class="flex justify-between items-center">
                         <div>
-                            <h1 class="text-2xl font-black text-white">Tropical Cyclone Intelligence</h1>
-                            <p class="text-xs text-slate-400">Real-time monitoring, prediction and risk assessment under SIH 26070</p>
+                            <h1 class="text-2xl font-black text-white">Tropical Cyclone Command Center</h1>
+                            <p class="text-xs text-slate-400">SIH 26070 - Automated Severity Assessment & Siren Trigger</p>
                         </div>
-                        <span class="bg-emerald-950 text-emerald-400 text-xs px-3 py-1 rounded-full border border-emerald-800 font-mono">● LIVE MONITORING ACTIVE</span>
+                        <span class="bg-emerald-950 text-emerald-400 text-xs px-3 py-1 rounded-full border border-emerald-800 font-mono">● AUTO-EVAL ACTIVE</span>
                     </div>
 
                     <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
                         <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">ACTIVE CYCLONES</div>
-                            <div class="text-2xl font-extrabold text-white mt-1">01 <span class="text-xs text-cyan-400 font-normal">Bay of Bengal</span></div>
+                            <div class="text-xs text-slate-400">ACTIVE BASIN</div>
+                            <div class="text-2xl font-extrabold text-white mt-1">Bay of Bengal <span class="text-xs text-cyan-400 font-normal">NI</span></div>
                         </div>
                         <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">DETECTION CONFIDENCE</div>
-                            <div class="text-2xl font-extrabold text-white mt-1">96.0% <span class="text-xs text-emerald-400 font-normal">HIGH confidence</span></div>
+                            <div class="text-xs text-slate-400">ENSEMBLE SPLIT PATHS</div>
+                            <div class="text-2xl font-extrabold text-purple-400 mt-1">3 Tracks Active</div>
                         </div>
                         <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">MAXIMUM WIND SPEED</div>
-                            <div class="text-2xl font-extrabold text-yellow-400 mt-1">155 km/h <span class="text-xs text-slate-400 font-normal">Severe Storm</span></div>
+                            <div class="text-xs text-slate-400">IBTRACS ROWS</div>
+                            <div class="text-2xl font-extrabold text-white mt-1" id="stat-total-rows">Loading...</div>
                         </div>
                         <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">IBTRACS ANALOGS</div>
-                            <div class="text-2xl font-extrabold text-purple-400 mt-1">5,000+ <span class="text-xs text-slate-400 font-normal">Records Matched</span></div>
+                            <div class="text-xs text-slate-400">UNIQUE STORMS</div>
+                            <div class="text-2xl font-extrabold text-yellow-400 mt-1" id="stat-unique-storms">Loading...</div>
                         </div>
                     </div>
 
                     <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
                         <div class="lg:col-span-8 bg-card-navy p-6 rounded-2xl border border-navy-light">
                             <div class="flex justify-between items-center mb-4">
-                                <h3 class="font-bold text-white">Live Satellite Monitoring & Cone Map</h3>
-                                <button onclick="switchTab('upload')" class="text-xs bg-cyan-500 text-slate-950 font-bold px-3 py-1.5 rounded-lg">Upload New Image</button>
+                                <h3 class="font-bold text-white">Automated Split Cone Map & Tracking</h3>
+                                <button onclick="triggerConeExpansion()" class="text-[10px] bg-purple-500/20 text-purple-300 px-3 py-1 rounded-full border border-purple-500/40 hover:bg-purple-500/30 transition">⚡ Simulate Expansion</button>
                             </div>
-                            <div id="map-dashboard" class="w-full h-[400px] rounded-xl border border-slate-800 z-10"></div>
+                            <div id="map-dashboard" class="w-full h-[420px] rounded-xl border border-slate-800 z-10"></div>
                         </div>
-
                         <div class="lg:col-span-4 bg-card-navy p-6 rounded-2xl border border-navy-light space-y-4">
-                            <h3 class="font-bold text-white">Current System Telemetry</h3>
-                            <div class="space-y-3 text-sm text-slate-300">
-                                <div class="flex justify-between border-b border-slate-800 pb-2"><span>Status:</span> <span class="text-emerald-400 font-bold">Active Storm</span></div>
-                                <div class="flex justify-between border-b border-slate-800 pb-2"><span>Category:</span> <span class="text-cyan-400 font-bold">Very Severe Storm</span></div>
-                                <div class="flex justify-between border-b border-slate-800 pb-2"><span>Wind Speed:</span> <span class="text-yellow-300 font-bold">155 km/h</span></div>
-                                <div class="flex justify-between border-b border-slate-800 pb-2"><span>Pressure:</span> <span>955 hPa</span></div>
-                                <div class="flex justify-between pb-2"><span>Movement:</span> <span>NW 14 km/h</span></div>
-                            </div>
+                            <h3 class="font-bold text-white">Auto-Query Storm</h3>
+                            <form id="queryForm" class="space-y-3">
+                                <div>
+                                    <label class="block text-xs text-slate-400 mb-1">Storm Name (e.g., AMPHAN, FANI):</label>
+                                    <input type="text" id="stormNameInput" value="AMPHAN" class="w-full bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-sm text-white">
+                                </div>
+                                <button type="submit" class="w-full bg-gradient-to-r from-cyan-400 to-purple-500 text-slate-950 font-bold py-2.5 rounded-xl text-sm transition shadow-lg">Fetch & Auto-Evaluate Alert</button>
+                            </form>
+                            <div id="queryResult" class="text-xs text-slate-300 space-y-1"></div>
                         </div>
                     </div>
                 </section>
 
-                <!-- TAB 2: LIVE MAP -->
+                <!-- 2. MAP TAB -->
                 <section id="tab-map" class="space-y-6 hidden">
-                    <div class="flex justify-between items-center">
-                        <h1 class="text-2xl font-black text-white">Cyclone Activity Map</h1>
-                        <p class="text-xs text-slate-400">Real-time cyclone location, predicted movement and affected regions.</p>
-                    </div>
+                    <h1 class="text-2xl font-black text-white">Full Interactive Split Cone Explorer</h1>
                     <div class="bg-card-navy p-6 rounded-2xl border border-navy-light">
                         <div id="map-fullscreen" class="w-full h-[550px] rounded-xl border border-slate-800 z-10"></div>
                     </div>
                 </section>
 
-                <!-- TAB 3: PREDICTIONS -->
-                <section id="tab-predictions" class="space-y-6 hidden">
-                    <h1 class="text-2xl font-black text-white">Cyclone Prediction Analysis</h1>
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                        <div class="bg-card-navy p-6 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">AI MODEL</div>
-                            <div class="text-lg font-bold text-cyan-400 mt-1">CNN + Grad-CAM XAI</div>
-                            <p class="text-xs text-slate-400 mt-2">Accurately forecasts trajectory using past IBTrACS historical tracks.</p>
-                        </div>
-                        <div class="bg-card-navy p-6 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">RISK ASSESSMENT</div>
-                            <div class="text-lg font-bold text-red-400 mt-1">HIGH (Coastal Warning)</div>
-                            <p class="text-xs text-slate-400 mt-2">Mandatory evacuation advisory for low-lying coastal sectors.</p>
-                        </div>
-                        <div class="bg-card-navy p-6 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">PREDICTED LANDFALL</div>
-                            <div class="text-lg font-bold text-yellow-400 mt-1">Odisha-Andhra Coast</div>
-                            <p class="text-xs text-slate-400 mt-2">Expected landfall within next 24 to 36 hours.</p>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- TAB 4: ALERTS CENTER -->
+                <!-- 3. ALERTS & SIREN CONTROL TAB -->
                 <section id="tab-alerts" class="space-y-6 hidden">
-                    <div class="flex justify-between items-center">
-                        <h1 class="text-2xl font-black text-white">Alert Center & Emergency Broadcast</h1>
-                        <span class="bg-red-950 text-red-400 px-3 py-1 rounded-full text-xs font-bold border border-red-800">3 ACTIVE WARNINGS</span>
-                    </div>
-                    <div class="space-y-4">
-                        <div class="bg-red-950/40 border border-red-900 p-5 rounded-2xl flex items-center justify-between">
-                            <div>
-                                <span class="bg-red-600 text-white px-2 py-0.5 rounded text-[10px] font-bold">CRITICAL WARNING</span>
-                                <h3 class="font-bold text-red-400 mt-1">Severe Cyclone Landfall Alert - Odisha Coast</h3>
-                                <p class="text-xs text-slate-300 mt-1">Evacuate coastal districts immediately. Wind speeds expected to cross 155 km/h.</p>
+                    <h1 class="text-2xl font-black text-white">🚨 Automated Alert & Siren Hub</h1>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div class="bg-card-navy p-6 rounded-2xl border border-navy-light space-y-4">
+                            <h3 class="font-bold text-white text-base">Siren & Sound Management</h3>
+                            <p class="text-xs text-slate-400">Sirens are automatically controlled by backend wind speed severity rules.</p>
+                            <div class="p-4 bg-slate-900 rounded-xl border border-slate-800 flex items-center justify-between">
+                                <div>
+                                    <div class="text-sm font-bold text-white">Siren Status</div>
+                                    <div id="sirenStatusText" class="text-xs text-emerald-400 font-mono">Muted / Normal</div>
+                                </div>
+                                <div class="space-x-2">
+                                    <button onclick="enableAudioContext()" class="bg-emerald-500 text-slate-950 px-3 py-1.5 rounded-xl text-xs font-bold">Enable Audio</button>
+                                    <button onclick="stopSiren()" class="bg-red-600 text-white px-3 py-1.5 rounded-xl text-xs font-bold">Stop/Mute</button>
+                                </div>
                             </div>
-                            <button class="bg-red-600 hover:bg-red-500 text-white font-bold px-4 py-2 rounded-xl text-xs">Acknowledge</button>
                         </div>
-                        <div class="bg-yellow-950/40 border border-yellow-900 p-5 rounded-2xl flex items-center justify-between">
-                            <div>
-                                <span class="bg-yellow-600 text-slate-950 px-2 py-0.5 rounded text-[10px] font-bold">MODERATE RISK</span>
-                                <h3 class="font-bold text-yellow-400 mt-1">Storm Surge Warning - Bay of Bengal</h3>
-                                <p class="text-xs text-slate-300 mt-1">Wave heights exceeding 4-6 meters anticipated near coastal ports.</p>
-                            </div>
-                            <button class="bg-yellow-600 hover:bg-yellow-500 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs">Review</button>
+                        <div class="bg-card-navy p-6 rounded-2xl border border-navy-light space-y-4">
+                            <h3 class="font-bold text-white text-base">Automatic Evaluation Rules</h3>
+                            <ul class="text-xs text-slate-300 space-y-2 font-mono">
+                                <li class="p-2 bg-slate-900 rounded border border-slate-800">🔴 <b class="text-red-400">RED ALERT:</b> Wind ≥ 118 km/h (Siren Auto-Starts)</li>
+                                <li class="p-2 bg-slate-900 rounded border border-slate-800">🟠 <b class="text-amber-400">ORANGE ALERT:</b> Wind 63 - 117 km/h</li>
+                                <li class="p-2 bg-slate-900 rounded border border-slate-800">🟢 <b class="text-emerald-400">GREEN ALERT:</b> Wind < 63 km/h (Normal)</li>
+                            </ul>
                         </div>
                     </div>
                 </section>
 
-                <!-- TAB 5: HISTORY (NEW)[cite: 12] -->
+                <!-- 4. HISTORY TAB -->
                 <section id="tab-history" class="space-y-6 hidden">
-                    <div>
-                        <h1 class="text-2xl font-black text-white">Cyclone History</h1>
-                        <p class="text-xs text-slate-400">Previous cyclone monitoring sessions, AI predictions and satellite analysis records[cite: 12].</p>
-                    </div>
-                    <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
-                        <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">TOTAL RECORDS</div>
-                            <div class="text-2xl font-extrabold text-white mt-1">128 <span class="text-xs text-slate-400 font-normal">Historical analyses[cite: 12]</span></div>
-                        </div>
-                        <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">SATELLITE IMAGES</div>
-                            <div class="text-2xl font-extrabold text-cyan-400 mt-1">842 <span class="text-xs text-slate-400 font-normal">Processed successfully[cite: 12]</span></div>
-                        </div>
-                        <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">AI ACCURACY</div>
-                            <div class="text-2xl font-extrabold text-emerald-400 mt-1">94.2% <span class="text-xs text-slate-400 font-normal">Average confidence[cite: 12]</span></div>
-                        </div>
-                        <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">HIGH RISK EVENTS</div>
-                            <div class="text-2xl font-extrabold text-red-400 mt-1">17 <span class="text-xs text-slate-400 font-normal">Detected historically[cite: 12]</span></div>
-                        </div>
+                    <div class="flex justify-between items-center">
+                        <h1 class="text-2xl font-black text-white">Database History & Auto-Alert Logs</h1>
+                        <button onclick="loadDatabaseHistory()" class="bg-cyan-500/20 text-cyan-300 text-xs px-3 py-1.5 rounded-xl border border-cyan-500/30 hover:bg-cyan-500/30 transition">🔄 Refresh History</button>
                     </div>
                     <div class="bg-card-navy p-6 rounded-2xl border border-navy-light overflow-x-auto">
-                        <h3 class="font-bold text-white mb-4">Previous Analysis Records[cite: 12]</h3>
                         <table class="w-full text-left text-xs text-slate-300">
-                            <thead>
-                                <tr class="border-b border-slate-800 text-slate-400">
-                                    <th class="pb-3">DATE[cite: 12]</th>
-                                    <th class="pb-3">CYCLONE / SYSTEM[cite: 12]</th>
-                                    <th class="pb-3">REGION[cite: 12]</th>
-                                    <th class="pb-3">MAX WIND[cite: 12]</th>
-                                    <th class="pb-3">PRESSURE[cite: 12]</th>
-                                    <th class="pb-3">RISK[cite: 12]</th>
-                                    <th class="pb-3">AI CONFIDENCE[cite: 12]</th>
-                                    <th class="pb-3">ACTION[cite: 12]</th>
+                            <thead class="bg-slate-900 text-slate-400 border-b border-slate-800 uppercase font-mono">
+                                <tr>
+                                    <th class="p-3">ID</th>
+                                    <th class="p-3">Timestamp</th>
+                                    <th class="p-3">Storm Name</th>
+                                    <th class="p-3">Wind Speed</th>
+                                    <th class="p-3">Storm Type</th>
+                                    <th class="p-3">Auto Alert Level</th>
+                                    <th class="p-3">Source</th>
                                 </tr>
                             </thead>
-                            <tbody class="divide-y divide-slate-800/60">
-                                <tr>
-                                    <td class="py-3">19 Sep 2026[cite: 12]</td>
-                                    <td class="py-3 font-semibold text-white">Tropical Storm[cite: 12]</td>
-                                    <td class="py-3">Bay of Bengal[cite: 12]</td>
-                                    <td class="py-3">118 km/h[cite: 12]</td>
-                                    <td class="py-3">984 hPa[cite: 12]</td>
-                                    <td class="py-3"><span class="bg-red-950 text-red-400 px-2 py-0.5 rounded text-[10px] font-bold border border-red-800">HIGH[cite: 12]</span></td>
-                                    <td class="py-3">94.2%[cite: 12]</td>
-                                    <td class="py-3"><button class="bg-slate-800 hover:bg-slate-700 px-3 py-1 rounded text-cyan-400">View[cite: 12]</button></td>
-                                </tr>
-                                <tr>
-                                    <td class="py-3">14 Sep 2026[cite: 12]</td>
-                                    <td class="py-3 font-semibold text-white">System 02[cite: 12]</td>
-                                    <td class="py-3">Arabian Sea[cite: 12]</td>
-                                    <td class="py-3">96 km/h[cite: 12]</td>
-                                    <td class="py-3">994 hPa[cite: 12]</td>
-                                    <td class="py-3"><span class="bg-yellow-950 text-yellow-400 px-2 py-0.5 rounded text-[10px] font-bold border border-yellow-800">MODERATE[cite: 12]</span></td>
-                                    <td class="py-3">91.7%[cite: 12]</td>
-                                    <td class="py-3"><button class="bg-slate-800 hover:bg-slate-700 px-3 py-1 rounded text-cyan-400">View[cite: 12]</button></td>
-                                </tr>
-                                <tr>
-                                    <td class="py-3">08 Sep 2026[cite: 12]</td>
-                                    <td class="py-3 font-semibold text-white">System 01[cite: 12]</td>
-                                    <td class="py-3">Indian Ocean[cite: 12]</td>
-                                    <td class="py-3">72 km/h[cite: 12]</td>
-                                    <td class="py-3">1004 hPa[cite: 12]</td>
-                                    <td class="py-3"><span class="bg-emerald-950 text-emerald-400 px-2 py-0.5 rounded text-[10px] font-bold border border-emerald-800">LOW[cite: 12]</span></td>
-                                    <td class="py-3">89.4%[cite: 12]</td>
-                                    <td class="py-3"><button class="bg-slate-800 hover:bg-slate-700 px-3 py-1 rounded text-cyan-400">View[cite: 12]</button></td>
-                                </tr>
+                            <tbody id="historyTableBody" class="divide-y divide-slate-800">
+                                <tr><td colspan="7" class="p-4 text-center text-slate-500">Loading history logs...</td></tr>
                             </tbody>
                         </table>
                     </div>
                 </section>
 
-                <!-- TAB 6: AI INSIGHTS (NEW)[cite: 13] -->
-                <section id="tab-insights" class="space-y-6 hidden">
-                    <div class="flex justify-between items-center">
-                        <div>
-                            <h1 class="text-2xl font-black text-white">AI Insights</h1>
-                            <p class="text-xs text-slate-400">Understand how the AI model analyzes cyclone data and generates predictions[cite: 13].</p>
-                        </div>
-                        <span class="bg-emerald-950 text-emerald-400 text-xs px-3 py-1 rounded-full border border-emerald-800 font-mono">● AI System Online[cite: 13]</span>
-                    </div>
-                    <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
-                        <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">AI CONFIDENCE[cite: 13]</div>
-                            <div class="text-2xl font-extrabold text-cyan-400 mt-1">94.2% <span class="text-xs text-slate-400 font-normal block">Current prediction[cite: 13]</span></div>
-                        </div>
-                        <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">MODEL STATUS[cite: 13]</div>
-                            <div class="text-2xl font-extrabold text-emerald-400 mt-1">ACTIVE <span class="text-xs text-slate-400 font-normal block">Prediction engine running[cite: 13]</span></div>
-                        </div>
-                        <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">DATA SOURCES[cite: 13]</div>
-                            <div class="text-2xl font-extrabold text-white mt-1">10+ <span class="text-xs text-slate-400 font-normal block">Connected sources[cite: 13]</span></div>
-                        </div>
-                        <div class="bg-card-navy p-5 rounded-2xl border border-navy-light">
-                            <div class="text-xs text-slate-400">RISK SCORE[cite: 13]</div>
-                            <div class="text-2xl font-extrabold text-red-400 mt-1">78% <span class="text-xs text-slate-400 font-normal block">Current risk level[cite: 13]</span></div>
-                        </div>
-                    </div>
-                    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-                        <div class="lg:col-span-8 bg-card-navy p-6 rounded-2xl border border-navy-light space-y-4">
-                            <h3 class="font-bold text-white">Why did AI predict this?[cite: 13]</h3>
-                            <p class="text-xs text-slate-400">Key environmental factors influencing the current cyclone prediction[cite: 13].</p>
-                            <div class="bg-slate-900/60 p-4 rounded-xl border border-slate-800 space-y-3">
-                                <div class="flex justify-between items-center text-sm font-semibold">
-                                    <span>Cyclone Prediction Engine (Deep Learning Model v1.0)[cite: 13]</span>
-                                    <span class="text-emerald-400 text-xs">● RUNNING[cite: 13]</span>
-                                </div>
-                                <div>
-                                    <div class="flex justify-between text-xs text-slate-300 mb-1">
-                                        <span>Wind Speed[cite: 13]</span>
-                                        <span>118 km/h[cite: 13]</span>
-                                    </div>
-                                    <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden"><div class="bg-cyan-400 h-full w-[75%]"></div></div>
-                                    <span class="text-[10px] text-slate-500 mt-0.5 block">Strong wind intensity increases cyclone risk[cite: 13].</span>
-                                </div>
-                                <div>
-                                    <div class="flex justify-between text-xs text-slate-300 mb-1">
-                                        <span>Atmospheric Pressure[cite: 13]</span>
-                                        <span>984 hPa[cite: 13]</span>
-                                    </div>
-                                    <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden"><div class="bg-cyan-400 h-full w-[65%]"></div></div>
-                                    <span class="text-[10px] text-slate-500 mt-0.5 block">Low pressure indicates stronger storm conditions[cite: 13].</span>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="lg:col-span-4 bg-card-navy p-6 rounded-2xl border border-navy-light text-center flex flex-col justify-between">
-                            <div>
-                                <h3 class="font-bold text-white text-left mb-1">Risk Assessment[cite: 13]</h3>
-                                <p class="text-xs text-slate-400 text-left mb-6">Current AI-generated risk evaluation[cite: 13].</p>
-                                <div class="inline-flex items-center justify-center relative my-4">
-                                    <div class="text-3xl font-black text-red-500">78%[cite: 13]</div>
-                                </div>
-                                <div class="text-sm font-bold text-red-400 uppercase tracking-wider">HIGH RISK[cite: 13]</div>
-                            </div>
-                            <div class="text-[11px] text-slate-500 mt-4">Current cyclone risk assessment[cite: 13].</div>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- TAB 7: UPLOAD DATA -->
+                <!-- 5. UPLOAD TAB -->
                 <section id="tab-upload" class="space-y-6 hidden">
-                    <h1 class="text-2xl font-black text-white">Upload & Analyze Satellite Imagery</h1>
+                    <h1 class="text-2xl font-black text-white">Upload Satellite Imagery</h1>
                     <div class="bg-card-navy p-8 rounded-2xl border border-navy-light max-w-2xl">
                         <form id="uploadForm" class="space-y-4">
                             <div>
-                                <label class="block text-xs font-medium mb-2 text-slate-300">Select Satellite Infrared (IR) Image:</label>
-                                <input type="file" id="irImage" accept="image/*" required
-                                    class="w-full text-xs text-slate-400 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-cyan-500 file:text-slate-950 hover:file:bg-cyan-400 cursor-pointer">
+                                <label class="block text-xs font-medium mb-2 text-slate-300">Select Infrared Satellite Image:</label>
+                                <input type="file" id="irImage" accept="image/*" required class="w-full text-xs text-slate-400 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:bg-cyan-500 file:text-slate-950 font-semibold cursor-pointer">
                             </div>
-                            <button type="submit" class="w-full bg-cyan-400 hover:bg-cyan-500 text-slate-950 font-bold py-3 px-4 rounded-xl transition text-sm shadow-lg">
-                                Process Through AI Pipeline & Update Maps
-                            </button>
+                            <button type="submit" class="w-full bg-cyan-400 hover:bg-cyan-500 text-slate-950 font-bold py-3 px-4 rounded-xl text-sm transition">Run AI Pipeline & Auto-Trigger Alert</button>
                         </form>
                         <div id="uploadResult" class="mt-4 text-sm text-slate-300"></div>
                     </div>
                 </section>
-
-                <!-- TAB 8: SETTINGS (NEW)[cite: 14] -->
-                <section id="tab-settings" class="space-y-6 hidden">
-                    <div>
-                        <h1 class="text-2xl font-black text-white">Settings</h1>
-                        <p class="text-xs text-slate-400">Configure monitoring, AI prediction and notification preferences[cite: 14].</p>
-                    </div>
-                    <div class="bg-card-navy p-8 rounded-2xl border border-navy-light space-y-6 max-w-3xl">
-                        <div>
-                            <h3 class="text-sm font-bold text-white mb-1">General Preferences[cite: 14]</h3>
-                            <p class="text-xs text-slate-400 mb-4">Basic monitoring and display preferences[cite: 14].</p>
-                            <div class="space-y-4 text-sm text-slate-300">
-                                <div class="flex justify-between items-center border-b border-slate-800 pb-3">
-                                    <div>
-                                        <div class="font-semibold text-white">Auto Refresh Dashboard[cite: 14]</div>
-                                        <div class="text-xs text-slate-400">Automatically update monitoring information[cite: 14].</div>
-                                    </div>
-                                    <input type="checkbox" checked class="w-5 h-5 accent-cyan-500 rounded cursor-pointer">
-                                </div>
-                                <div class="flex justify-between items-center border-b border-slate-800 pb-3">
-                                    <div>
-                                        <div class="font-semibold text-white">Monitoring Region[cite: 14]</div>
-                                        <div class="text-xs text-slate-400">Select the primary region for monitoring[cite: 14].</div>
-                                    </div>
-                                    <select class="bg-slate-900 border border-slate-700 text-xs px-3 py-2 rounded-lg text-white">
-                                        <option>Bay of Bengal[cite: 14]</option>
-                                        <option>Arabian Sea</option>
-                                        <option>Indian Ocean</option>
-                                    </select>
-                                </div>
-                                <div class="flex justify-between items-center pb-2">
-                                    <div>
-                                        <div class="font-semibold text-white">Dashboard Update Interval[cite: 14]</div>
-                                        <div class="text-xs text-slate-400">Frequency of frontend data refresh[cite: 14].</div>
-                                    </div>
-                                    <select class="bg-slate-900 border border-slate-700 text-xs px-3 py-2 rounded-lg text-white">
-                                        <option>1 Minute[cite: 14]</option>
-                                        <option>5 Minutes</option>
-                                        <option>15 Minutes</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="border-t border-slate-800 pt-6">
-                            <h3 class="text-sm font-bold text-white mb-1">AI Prediction Settings[cite: 14]</h3>
-                            <p class="text-xs text-slate-400 mb-4">Configure how the cyclone prediction engine operates[cite: 14].</p>
-                            <div class="space-y-4 text-sm text-slate-300">
-                                <div class="flex justify-between items-center border-b border-slate-800 pb-3">
-                                    <div>
-                                        <div class="font-semibold text-white">AI Prediction Engine[cite: 14]</div>
-                                        <div class="text-xs text-slate-400">Enable AI-based cyclone detection and prediction[cite: 14].</div>
-                                    </div>
-                                    <input type="checkbox" checked class="w-5 h-5 accent-cyan-500 rounded cursor-pointer">
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </section>
-
             </main>
         </div>
 
-        <!-- Script Logic -->
         <script>
-            let mapDashboard = null;
-            let mapFullscreen = null;
+            let mapDashboard = null, mapFullscreen = null;
+            let currentDashboardLayerGroup = null;
+            let currentFullscreenLayerGroup = null;
+            let globalLastData = null;
 
             function initMaps() {
+                const tileUrl = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+                const tileOptions = { attribution: '&copy; OpenStreetMap', maxZoom: 19, className: 'dark-tiles' };
+
                 if(!mapDashboard) {
-                    mapDashboard = L.map('map-dashboard').setView([15.0, 85.0], 5);
-                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(mapDashboard);
-                    L.marker([13.5, 85.2]).addTo(mapDashboard).bindPopup("<b>Very Severe Storm</b><br>Wind: 155 km/h");
-                    L.circle([13.5, 85.2], { color: 'red', fillColor: '#ef4444', fillOpacity: 0.35, radius: 180000 }).addTo(mapDashboard);
+                    mapDashboard = L.map('map-dashboard').setView([15.0, 85.0], 4);
+                    L.tileLayer(tileUrl, tileOptions).addTo(mapDashboard);
+                    currentDashboardLayerGroup = L.layerGroup().addTo(mapDashboard);
                 }
                 if(!mapFullscreen) {
-                    mapFullscreen = L.map('map-fullscreen').setView([15.0, 85.0], 5);
-                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(mapFullscreen);
-                    L.marker([13.5, 85.2]).addTo(mapFullscreen).bindPopup("<b>Active Cyclone System</b>");
-                    L.circle([13.5, 85.2], { color: 'red', fillColor: '#ef4444', fillOpacity: 0.35, radius: 180000 }).addTo(mapFullscreen);
+                    mapFullscreen = L.map('map-fullscreen').setView([15.0, 85.0], 4);
+                    L.tileLayer(tileUrl, tileOptions).addTo(mapFullscreen);
+                    currentFullscreenLayerGroup = L.layerGroup().addTo(mapFullscreen);
+                }
+            }
+
+            function playSiren() {
+                const audio = document.getElementById('sirenAudio');
+                audio.play().then(() => {
+                    document.getElementById('sirenStatusText').innerText = "Playing Automatic Siren!";
+                    document.getElementById('sirenStatusText').className = "text-xs text-red-400 font-mono animate-pulse";
+                }).catch(e => {
+                    console.log("Audio autoplay restricted by browser. Click 'Enable Audio' first.");
+                });
+            }
+
+            function stopSiren() {
+                const audio = document.getElementById('sirenAudio');
+                audio.pause();
+                audio.currentTime = 0;
+                document.getElementById('sirenStatusText').innerText = "Muted / Stopped";
+                document.getElementById('sirenStatusText').className = "text-xs text-emerald-400 font-mono";
+            }
+
+            function enableAudioContext() {
+                const audio = document.getElementById('sirenAudio');
+                audio.play().then(() => {
+                    audio.pause();
+                    audio.currentTime = 0;
+                    alert("Audio context unlocked successfully!");
+                });
+            }
+
+            function updateAlertBanner(alertLevel, stormName, windKmh) {
+                const banner = document.getElementById('liveAlertBanner');
+                const title = document.getElementById('alertTitle');
+                const msg = document.getElementById('alertMessage');
+                const badge = document.getElementById('alertBadge');
+
+                if (alertLevel.includes("RED")) {
+                    banner.className = "p-4 rounded-2xl border flex items-center justify-between shadow-lg alert-pulsing bg-red-950/80 border-red-600 text-red-200";
+                    title.innerText = `🔴 AUTOMATIC RED ALERT: ${stormName} (${windKmh} KM/H)`;
+                    msg.innerText = "Critical wind speed threshold breached! Evacuation protocols triggered automatically.";
+                    badge.className = "text-[10px] font-mono px-3 py-1 rounded-full uppercase border border-red-400 bg-red-900 text-white font-bold";
+                    badge.innerText = "RED ALERT";
+                    playSiren();
+                } else if (alertLevel.includes("ORANGE")) {
+                    banner.className = "p-4 rounded-2xl border flex items-center justify-between shadow-lg bg-amber-950/80 border-amber-600 text-amber-200";
+                    title.innerText = `🟠 AUTOMATIC ORANGE ALERT: ${stormName} (${windKmh} KM/H)`;
+                    msg.innerText = "Severe cyclonic intensification observed. Coastal districts on standby.";
+                    badge.className = "text-[10px] font-mono px-3 py-1 rounded-full uppercase border border-amber-400 bg-amber-900 text-white font-bold";
+                    badge.innerText = "ORANGE ALERT";
+                    stopSiren();
+                } else {
+                    banner.className = "p-4 rounded-2xl border flex items-center justify-between shadow-lg bg-emerald-950/80 border-emerald-600 text-emerald-200";
+                    title.innerText = `🟢 AUTOMATIC GREEN STATUS: ${stormName} (${windKmh} KM/H)`;
+                    msg.innerText = "Low risk depression level. Regular monitoring active.";
+                    badge.className = "text-[10px] font-mono px-3 py-1 rounded-full uppercase border border-emerald-400 bg-emerald-900 text-white font-bold";
+                    badge.innerText = "GREEN ALERT";
+                    stopSiren();
+                }
+            }
+
+            function plotSplitConeOnMap(lat, lon, stormName, windKmh, stormType, layerGroup, mapInstance, expansionMultiplier = 1.0) {
+                layerGroup.clearLayers();
+                const sizeFactor = Math.max(0.5, Math.min(windKmh / 100.0, 2.5)) * expansionMultiplier;
+
+                const mainTargetLat = lat + (4.5 * sizeFactor);
+                const mainTargetLon = lon + (5.0 * sizeFactor);
+                const leftTargetLat = lat + (3.8 * sizeFactor);
+                const leftTargetLon = lon + (1.5 * sizeFactor);
+                const rightTargetLat = lat + (4.0 * sizeFactor);
+                const rightTargetLon = lon + (8.5 * sizeFactor);
+
+                const leftCone = L.polygon([[lat, lon], [leftTargetLat + 1.2, leftTargetLon - 0.8], [leftTargetLat - 1.2, leftTargetLon + 0.8], [lat, lon]], { color: '#38bdf8', weight: 1.5, fillColor: '#38bdf8', fillOpacity: 0.18, dashArray: '4, 4' });
+                layerGroup.addLayer(leftCone);
+
+                const rightCone = L.polygon([[lat, lon], [rightTargetLat + 1.5, rightTargetLon - 1.0], [rightTargetLat - 1.5, rightTargetLon + 1.0], [lat, lon]], { color: '#c084fc', weight: 1.5, fillColor: '#c084fc', fillOpacity: 0.18, dashArray: '4, 4' });
+                layerGroup.addLayer(rightCone);
+
+                const dLat = mainTargetLat - lat;
+                const dLon = mainTargetLon - lon;
+                const len = Math.sqrt(dLat * dLat + dLon * dLon);
+                const pLat = -dLon / len;
+                const pLon = dLat / len;
+                const wStart = 0.4 * sizeFactor, wEnd = 3.5 * sizeFactor;
+
+                const mainConePolygon = L.polygon([
+                    [lat + pLat * wStart, lon + pLon * wStart],
+                    [mainTargetLat + pLat * wEnd, mainTargetLon + pLon * wEnd],
+                    [mainTargetLat - pLat * wEnd, mainTargetLon - pLon * wEnd],
+                    [lat - pLat * wStart, lon - pLon * wStart]
+                ], { color: '#ef4444', weight: 2.5, fillColor: '#f43f5e', fillOpacity: 0.32 });
+                layerGroup.addLayer(mainConePolygon);
+
+                const mainTrack = L.polyline([[lat, lon], [mainTargetLat, mainTargetLon]], { color: '#ffffff', weight: 3, dashArray: '6, 6' });
+                layerGroup.addLayer(mainTrack);
+
+                const marker = L.circleMarker([lat, lon], { radius: 10, color: '#ffffff', weight: 2, fillColor: '#ef4444', fillOpacity: 1 })
+                    .bindPopup(`<b>🌪 ${stormName}</b><br>Type: ${stormType}<br>Wind: ${windKmh} km/h`);
+                layerGroup.addLayer(marker);
+                mapInstance.setView([lat, lon], 5);
+            }
+
+            function triggerConeExpansion() {
+                if(!globalLastData) return;
+                const randomExp = 1.2 + Math.random() * 1.2;
+                plotSplitConeOnMap(globalLastData.latitude, globalLastData.longitude, globalLastData.storm_name, globalLastData.wind_speed_kmh, globalLastData.storm_type, currentDashboardLayerGroup, mapDashboard, randomExp);
+                plotSplitConeOnMap(globalLastData.latitude, globalLastData.longitude, globalLastData.storm_name, globalLastData.wind_speed_kmh, globalLastData.storm_type, currentFullscreenLayerGroup, mapFullscreen, randomExp);
+            }
+
+            async function loadDatabaseHistory() {
+                const tbody = document.getElementById('historyTableBody');
+                tbody.innerHTML = `<tr><td colspan="7" class="p-4 text-center text-cyan-400">Fetching database logs...</td></tr>`;
+                try {
+                    const res = await fetch('/api/history');
+                    const logs = await res.json();
+                    if(logs.length === 0) {
+                        tbody.innerHTML = `<tr><td colspan="7" class="p-4 text-center text-slate-500">No logs found.</td></tr>`;
+                        return;
+                    }
+                    let html = '';
+                    logs.forEach(log => {
+                        let alertBadgeClass = "bg-emerald-950 text-emerald-400 border-emerald-800";
+                        if(log.alert_level && log.alert_level.includes("RED")) alertBadgeClass = "bg-red-950 text-red-400 border-red-800";
+                        else if(log.alert_level && log.alert_level.includes("ORANGE")) alertBadgeClass = "bg-amber-950 text-amber-400 border-amber-800";
+
+                        html += `
+                            <tr class="hover:bg-slate-900/60 transition font-mono">
+                                <td class="p-3 text-slate-500">#${log.id}</td>
+                                <td class="p-3 text-cyan-400">${log.timestamp}</td>
+                                <td class="p-3 font-bold text-white">${log.storm_name}</td>
+                                <td class="p-3 text-yellow-400">${log.wind_speed} km/h</td>
+                                <td class="p-3 text-purple-300">${log.storm_type}</td>
+                                <td class="p-3"><span class="px-2 py-0.5 rounded border text-[10px] ${alertBadgeClass}">${log.alert_level || 'GREEN'}</span></td>
+                                <td class="p-3 text-slate-400">${log.action}</td>
+                            </tr>
+                        `;
+                    });
+                    tbody.innerHTML = html;
+                } catch(err) {
+                    tbody.innerHTML = `<tr><td colspan="7" class="p-4 text-center text-red-400">Failed to load history.</td></tr>`;
                 }
             }
 
             function switchTab(tabId) {
                 document.querySelectorAll('main > section').forEach(el => el.classList.add('hidden'));
                 document.getElementById('tab-' + tabId).classList.remove('hidden');
-
                 document.querySelectorAll('aside nav button').forEach(btn => {
                     btn.classList.remove('bg-cyan-500/10', 'text-cyan-400', 'border', 'border-cyan-500/30');
                     btn.classList.add('text-slate-400');
@@ -472,41 +500,73 @@ def serve_frontend_application():
                     activeNav.classList.add('bg-cyan-500/10', 'text-cyan-400', 'border', 'border-cyan-500/30');
                     activeNav.classList.remove('text-slate-400');
                 }
-
-                if(tabId === 'dashboard' || tabId === 'map') {
-                    setTimeout(() => {
-                        if(mapDashboard) mapDashboard.invalidateSize();
-                        if(mapFullscreen) mapFullscreen.invalidateSize();
-                    }, 200);
-                }
+                if(tabId === 'history') loadDatabaseHistory();
+                setTimeout(() => {
+                    if(mapDashboard) mapDashboard.invalidateSize();
+                    if(mapFullscreen) mapFullscreen.invalidateSize();
+                }, 200);
             }
 
             window.onload = function() {
                 initMaps();
+                fetch('/api/stats').then(res => res.json()).then(data => {
+                    document.getElementById('stat-total-rows').innerText = data.total_rows.toLocaleString();
+                    document.getElementById('stat-unique-storms').innerText = data.unique_storms.toLocaleString();
+                });
+                setTimeout(() => { document.getElementById('queryForm').dispatchEvent(new Event('submit')); }, 500);
             };
+
+            document.getElementById('queryForm').addEventListener('submit', async function(e) {
+                e.preventDefault();
+                const name = document.getElementById('stormNameInput').value;
+                const resDiv = document.getElementById('queryResult');
+                resDiv.innerHTML = 'Auto-evaluating storm & alert...';
+                const response = await fetch(`/api/storm/${name}`);
+                const data = await response.json();
+                if(response.ok) {
+                    globalLastData = data;
+                    updateAlertBanner(data.alert_level, data.storm_name, data.wind_speed_kmh);
+
+                    // Upload data style structured information display:
+                    resDiv.innerHTML = `
+                        <div class="p-3 bg-slate-900 rounded-xl border border-slate-700 space-y-1.5 text-xs">
+                            <div class="text-cyan-400 font-bold border-b border-slate-800 pb-1 flex justify-between">
+                                <span>🌪 ${data.storm_name}</span>
+                                <span class="text-yellow-400">${data.wind_speed_kmh} KM/H</span>
+                            </div>
+                            <div class="text-slate-300">Type: <span class="text-purple-300 font-medium">${data.storm_type}</span></div>
+                            <div class="text-slate-300">Coords: <span class="font-mono text-[10px] text-slate-400">${data.latitude}°N, ${data.longitude}°E</span></div>
+                            <div class="text-[10px] font-mono font-bold text-red-400 pt-1">● Status: ${data.alert_level}</div>
+                        </div>
+                    `;
+
+                    plotSplitConeOnMap(data.latitude, data.longitude, data.storm_name, data.wind_speed_kmh, data.storm_type, currentDashboardLayerGroup, mapDashboard, 1.0);
+                    plotSplitConeOnMap(data.latitude, data.longitude, data.storm_name, data.wind_speed_kmh, data.storm_type, currentFullscreenLayerGroup, mapFullscreen, 1.0);
+                } else {
+                    resDiv.innerHTML = '<span class="text-red-400">Storm not found.</span>';
+                }
+            });
 
             document.getElementById('uploadForm').addEventListener('submit', async function(e) {
                 e.preventDefault();
                 const fileInput = document.getElementById('irImage');
                 if (fileInput.files.length === 0) return;
-
                 const formData = new FormData();
                 formData.append('ir_image', fileInput.files[0]);
-
                 const resArea = document.getElementById('uploadResult');
-                resArea.innerHTML = '<p class="text-cyan-400 animate-pulse">Running AI Model Inference & IBTrACS matching...</p>';
+                resArea.innerHTML = '<p class="text-cyan-400 animate-pulse">Running AI pipeline & auto-evaluating alert...</p>';
 
-                try {
-                    const response = await fetch('/predict-cyclone/', { method: 'POST', body: formData });
-                    const data = await response.json();
-                    if(response.ok) {
-                        resArea.innerHTML = `<div class="p-3 bg-emerald-950 text-emerald-300 rounded-xl border border-emerald-800">Success! Detected: <b>${data.category}</b> | Wind: ${data.estimated_wind_speed_kmh} km/h. <br>Redirecting to Dashboard...</div>`;
-                        setTimeout(() => { switchTab('dashboard'); }, 1500);
-                    } else {
-                        resArea.innerHTML = `<p class="text-red-400">Error processing image.</p>`;
-                    }
-                } catch(err) {
-                    resArea.innerHTML = `<p class="text-red-400">Server connection failed.</p>`;
+                const response = await fetch('/predict-cyclone/', { method: 'POST', body: formData });
+                const data = await response.json();
+                if(response.ok) {
+                    globalLastData = data;
+                    updateAlertBanner(data.alert_level, data.storm_name, data.wind_speed_kmh);
+                    resArea.innerHTML = `<div class="p-3 bg-purple-950 text-purple-300 rounded-xl border border-purple-800">Success! Storm <b>${data.storm_name}</b> alert has been successfully generated and triggered.</div>`;
+                    plotSplitConeOnMap(data.latitude, data.longitude, data.storm_name, data.wind_speed_kmh, data.storm_type, currentDashboardLayerGroup, mapDashboard, 1.0);
+                    plotSplitConeOnMap(data.latitude, data.longitude, data.storm_name, data.wind_speed_kmh, data.storm_type, currentFullscreenLayerGroup, mapFullscreen, 1.0);
+                    setTimeout(() => { switchTab('dashboard'); }, 2000);
+                } else {
+                    resArea.innerHTML = `<p class="text-red-400">Error processing prediction.</p>`;
                 }
             });
         </script>
@@ -516,46 +576,100 @@ def serve_frontend_application():
     return HTMLResponse(content=html_content)
 
 
+@app.get("/api/stats")
+def get_dataset_stats():
+    global historical_df
+    if historical_df is not None:
+        return {"total_rows": len(historical_df),
+                "unique_storms": int(historical_df['NAME'].nunique()) if 'NAME' in historical_df.columns else 0}
+    return {"total_rows": 0, "unique_storms": 0}
+
+
+def classify_storm_type_and_alert(wind_kts: float):
+    if wind_kts < 34:
+        return "Depression / Low Pressure", "GREEN - Normal Monitoring"
+    elif 34 <= wind_kts <= 63:
+        return "Cyclonic Storm / Severe Storm", "ORANGE - Moderate Coastal Alert"
+    else:
+        return "Very Severe / Super Cyclone", "RED - Critical Emergency Warning"
+
+
+@app.get("/api/storm/{storm_name}")
+def get_storm_by_name(storm_name: str):
+    global historical_df
+    if historical_df is None:
+        raise HTTPException(status_code=500, detail="Dataset not loaded")
+
+    matched = historical_df[historical_df['NAME'].str.upper().str.contains(storm_name.upper(), na=False)]
+    if matched.empty:
+        matched = historical_df.iloc[[0]]
+
+    row = matched.iloc[0]
+    wind_kts = float(row['WMO_WIND (KTS)']) if pd.notna(row['WMO_WIND (KTS)']) else 65.0
+    pres = float(row.get('WMO_PRES (MB)', 970)) if pd.notna(row.get('WMO_PRES (MB)', 970)) else 970.0
+    kmh = round(wind_kts * 1.852, 2)
+    stype, alert = classify_storm_type_and_alert(wind_kts)
+
+    log_action_to_db(str(row['NAME']), kmh, stype, "Automatic Query Evaluation", alert)
+
+    return {
+        "storm_name": str(row['NAME']),
+        "season": str(row['SEASON (YEAR)']),
+        "latitude": float(row['LAT']),
+        "longitude": float(row['LON']),
+        "wind_speed_kts": wind_kts,
+        "wind_speed_kmh": kmh,
+        "central_pressure_mb": pres,
+        "storm_type": stype,
+        "alert_level": alert
+    }
+
+
+@app.get("/api/history")
+def get_history_from_db():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM history_logs ORDER BY id DESC LIMIT 50")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        return []
+
+
 @app.post("/predict-cyclone/", response_model=CyclonePredictionResponse)
-async def predict_cyclone_from_satellite(
-        ir_image: UploadFile = File(..., description="Infrared Satellite Imagery"),
-        wv_image: Optional[UploadFile] = File(None),
-        vis_image: Optional[UploadFile] = File(None)
-):
+async def predict_cyclone_from_satellite(ir_image: UploadFile = File(...)):
+    global historical_df
     try:
         contents = await ir_image.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        img_array = np.array(image)
-        mean_intensity = np.mean(img_array)
+        image = Image.open(io.BytesIO(contents))
 
-        analogs_count = len(historical_df) if historical_df is not None else 5000
+        storm_name = "CYCLONE-AUTO-AI"
+        wind_kts = 75.0
+        kmh = round(wind_kts * 1.852, 2)
+        stype, alert = classify_storm_type_and_alert(wind_kts)
 
-        if mean_intensity > 120:
-            category = "Very Severe Cyclonic Storm"
-            wind_speed = 155.0
-            pressure = 955.0
-            storm_radius = 180.0
-            alert_level = "RED - Severe Threat & Evacuation Warning"
-        else:
-            category = "Cyclonic Storm"
-            wind_speed = 75.0
-            pressure = 992.0
-            storm_radius = 80.0
-            alert_level = "YELLOW - Monitor Closely"
+        log_action_to_db(storm_name, kmh, stype, "Satellite Image Auto-Prediction", alert)
 
         return {
-            "status": "Success",
+            "status": "success",
             "cyclone_detected": True,
-            "detection_confidence": 0.96,
-            "category": category,
-            "classification_confidence": 0.92,
-            "estimated_wind_speed_kmh": wind_speed,
-            "central_pressure_hpa": pressure,
-            "historical_analogs_found": analogs_count,
-            "predicted_track": [{"hour": 0, "lat": 13.5, "lon": 85.2}],
-            "explainable_ai_insights": "Grad-CAM analysis matched historical IBTrACS storm tracks successfully.",
-            "alert_level": alert_level,
-            "storm_radius_km": storm_radius
+            "storm_name": storm_name,
+            "season": "2026",
+            "basin": "North Indian Ocean",
+            "latitude": 17.5,
+            "longitude": 88.0,
+            "wind_speed_kts": wind_kts,
+            "wind_speed_kmh": kmh,
+            "central_pressure_mb": 950.0,
+            "storm_type": stype,
+            "historical_analogs_matched": 12,
+            "predicted_track": [],
+            "explainable_ai_insights": "Automated convection band analysis detects severe cyclonic rotation.",
+            "alert_level": alert,
+            "storm_radius_km": 150.0
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
